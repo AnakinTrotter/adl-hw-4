@@ -253,8 +253,8 @@ def generate_qa_pairs(info_path: str, view_index: int, img_width: int = 150, img
         if k.get("is_center_kart"): continue
         name = k["kart_name"]
         cx, cy = k["center"]
-        lr = "left" if cx < ex else "right"
-        fb = "front" if cy < ey else "behind"
+        lr = "left" if cx <= ex else "right"
+        fb = "front" if cy <= ey else "back"
         qa_list.append({"question": f"Is {name} to the left or right of the ego car?", "answer": lr})
         qa_list.append({"question": f"Is {name} in front of or behind the ego car?", "answer": fb})
         qa_list.append({"question": f"Where is {name} relative to the ego car?", "answer": f"{fb} and {lr}"})
