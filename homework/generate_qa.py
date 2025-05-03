@@ -151,56 +151,47 @@ def extract_kart_objects(
         - center: (x, y) coordinates of the kart's center
         - is_center_kart: Boolean indicating if this is the kart closest to image center
     """
-    import math
+    import json, math
     from pathlib import Path
     from PIL import Image
-    import json
 
-    # Load JSON info
     info_path = Path(info_path)
-    with open(info_path) as f:
-        info = json.load(f)
-
-    # Construct and load image
-    base_name = info_path.stem.replace("_info", "")
-    image_file = info_path.parent / f"{base_name}_{view_index:02d}_im.jpg"
-    img = Image.open(image_file)
+    info = json.loads(info_path.read_text())
+    base = info_path.stem.replace("_info", "")
+    img_file = info_path.parent / f"{base}_{view_index:02d}_im.jpg"
+    img = Image.open(img_file)
     img_w, img_h = img.size
-
-    # Compute scaling
-    scale_x = img_w / ORIGINAL_WIDTH
-    scale_y = img_h / ORIGINAL_HEIGHT
-
+    scale_x, scale_y = img_w / ORIGINAL_WIDTH, img_h / ORIGINAL_HEIGHT
     karts = []
-    detections = info.get("detections", [])
-    frame_dets = detections[view_index] if view_index < len(detections) else []
-    kart_names = info.get("kart_names", [])
-    for det in frame_dets:
-        class_id, track_id, x1, y1, x2, y2 = det
+    # extract detections for this view
+    dets = info.get("detections", [])
+    if view_index >= len(dets):
+        return []
+    for class_id, track_id, x1, y1, x2, y2 in dets[view_index]:
         if int(class_id) != 1:
             continue
-        # Scale coords
         x1s, y1s = x1 * scale_x, y1 * scale_y
         x2s, y2s = x2 * scale_x, y2 * scale_y
-        # Filter small/outside boxes
         if (x2s - x1s) < min_box_size or (y2s - y1s) < min_box_size:
             continue
-        if x2s < 0 or x1s > img_w or y2s < 0 or y1s > img_h:
-            continue
         cx, cy = (x1s + x2s) / 2, (y1s + y2s) / 2
-        name = kart_names[track_id] if track_id < len(kart_names) else str(track_id)
+        names = info.get("kart_names", [])
+        name = names[track_id] if track_id < len(names) else str(track_id)
         karts.append({"instance_id": track_id, "kart_name": name, "center": (cx, cy)})
 
-    # Identify center kart by proximity to image center
-    img_center = (img_w / 2, img_h / 2)
-    ego_id, min_dist = None, float("inf")
-    for obj in karts:
-        dx, dy = obj["center"][0] - img_center[0], obj["center"][1] - img_center[1]
+    # find ego (closest to center)
+    if not karts:
+        return []
+    center = (img_w / 2, img_h / 2)
+    ego_id, best = None, float("inf")
+    for k in karts:
+        dx = k["center"][0] - center[0]
+        dy = k["center"][1] - center[1]
         dist = math.hypot(dx, dy)
-        if dist < min_dist:
-            min_dist, ego_id = dist, obj["instance_id"]
-    for obj in karts:
-        obj["is_center_kart"] = (obj["instance_id"] == ego_id)
+        if dist < best:
+            best, ego_id = dist, k["instance_id"]
+    for k in karts:
+        k["is_center_kart"] = (k["instance_id"] == ego_id)
     return karts
 
 
@@ -217,10 +208,7 @@ def extract_track_info(info_path: str) -> str:
     import json
     from pathlib import Path
 
-    info_path = Path(info_path)
-    with open(info_path) as f:
-        info = json.load(f)
-    # Try common keys for track
+    info = json.loads(Path(info_path).read_text())
     track = info.get("track_name") or info.get("track") or info.get("map_name") or info.get("map")
     if not track:
         raise KeyError("Track information not found in JSON")
@@ -242,48 +230,46 @@ def generate_qa_pairs(info_path: str, view_index: int, img_width: int = 150, img
     """
     from pathlib import Path
 
-    # Generate QA pairs for one view
+    # generate QA for a view
     karts = extract_kart_objects(info_path, view_index)
+    if not karts:
+        return []
     track = extract_track_info(info_path)
-    ego = next(obj for obj in karts if obj["is_center_kart"])
-    ego_name = ego["kart_name"]
-    ego_cx, ego_cy = ego["center"]
-
+    center_karts = [k for k in karts if k.get("is_center_kart")]
+    if not center_karts:
+        return []
+    ego = center_karts[0]
+    ex, ey = ego["center"]
     qa_list = []
-    # 1. Ego car identity
-    qa_list.append({"question": "What kart is the ego car?", "answer": ego_name})
-    # 2. Total karts
+    # 1. ego identity
+    qa_list.append({"question": "What kart is the ego car?", "answer": ego["kart_name"]})
+    # 2. total karts
     qa_list.append({"question": "How many karts are there in the scenario?", "answer": str(len(karts))})
-    # 3. Track info
+    # 3. track info
     qa_list.append({"question": "What track is this?", "answer": track})
-
-    # 4. Relative and combined positions
-    left_count = front_count = 0
-    for obj in karts:
-        if obj["is_center_kart"]:
-            continue
-        name = obj["kart_name"]
-        cx, cy = obj["center"]
-        lr = "left" if cx < ego_cx else "right"
-        fb = "front" if cy < ego_cy else "behind"
+    # 4. relative & combined positions
+    left_ct = front_ct = 0
+    for k in karts:
+        if k.get("is_center_kart"): continue
+        name = k["kart_name"]
+        cx, cy = k["center"]
+        lr = "left" if cx < ex else "right"
+        fb = "front" if cy < ey else "behind"
         qa_list.append({"question": f"Is {name} to the left or right of the ego car?", "answer": lr})
         qa_list.append({"question": f"Is {name} in front of or behind the ego car?", "answer": fb})
         qa_list.append({"question": f"Where is {name} relative to the ego car?", "answer": f"{fb} and {lr}"})
-        if lr == "left": left_count += 1
-        if fb == "front": front_count += 1
-
-    # 5. Aggregated counts
-    qa_list.append({"question": "How many karts are to the left of the ego car?", "answer": str(left_count)})
-    qa_list.append({"question": "How many karts are to the right of the ego car?", "answer": str(len(karts) - 1 - left_count)})
-    qa_list.append({"question": "How many karts are in front of the ego car?", "answer": str(front_count)})
-    qa_list.append({"question": "How many karts are behind the ego car?", "answer": str(len(karts) - 1 - front_count)})
-
-    # Attach image_file field
-    split = Path(info_path).parent.name
-    base = Path(info_path).stem.replace("_info", "")
-    img_rel = f"{split}/{base}_{view_index:02d}_im.jpg"
-    for e in qa_list:
-        e["image_file"] = img_rel
+        if lr == "left": left_ct += 1
+        if fb == "front": front_ct += 1
+    # 5. aggregated counts
+    qa_list.append({"question": "How many karts are to the left of the ego car?", "answer": str(left_ct)})
+    qa_list.append({"question": "How many karts are to the right of the ego car?", "answer": str(len(karts) - 1 - left_ct)})
+    qa_list.append({"question": "How many karts are in front of the ego car?", "answer": str(front_ct)})
+    qa_list.append({"question": "How many karts are behind the ego car?", "answer": str(len(karts) - 1 - front_ct)})
+    # attach image file path
+    p = Path(info_path)
+    img_rel = f"{p.parent.name}/{p.stem.replace('_info','')}_{view_index:02d}_im.jpg"
+    for qa in qa_list:
+        qa["image_file"] = img_rel
     return qa_list
 
 
@@ -323,22 +309,18 @@ def check_qa_pairs(info_file: str, view_index: int):
 
 
 def generate_all(split: str = "train"):
-    """Generate QA pairs for all info files in the specified split"""
+    """Generate QA pairs for every info.json in a split"""
     from pathlib import Path
     import json
-
-    data_dir = Path(__file__).parent.parent / "data" / split
-    all_qas = []
-    for info_file in sorted(data_dir.glob("*_info.json")):
-        with open(info_file) as f:
-            info = json.load(f)
-        num_views = len(info.get("detections", []))
-        for vi in range(num_views):
-            all_qas.extend(generate_qa_pairs(str(info_file), vi))
-    output_file = data_dir / f"{split}_qa_pairs.json"
-    with open(output_file, "w") as fw:
-        json.dump(all_qas, fw, indent=2)
-    print(f"Saved {len(all_qas)} QA pairs to {output_file}")
+    out = []
+    base = Path(__file__).parent.parent / "data" / split
+    for info in sorted(base.glob("*_info.json")):
+        data = json.loads(info.read_text())
+        for i in range(len(data.get("detections", []))):
+            out.extend(generate_qa_pairs(str(info), i))
+    dest = base / f"{split}_qa_pairs.json"
+    dest.write_text(json.dumps(out, indent=2))
+    print(f"Saved {len(out)} QA pairs to {dest}")
 
 
 """
